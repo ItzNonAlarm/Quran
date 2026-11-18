@@ -199,3 +199,91 @@ function verifyQuran(){
   if(total!==SURAH_TOTAL)bad.push('مجموع الآيات '+total+' بدل '+SURAH_TOTAL);
   alert(bad.length?('وجدت '+bad.length+' ملاحظة:\n'+bad.slice(0,12).join('\n')):'✓ الفحص سليم: ٦٠٤ صفحة، ١١٤ سورة بترتيبها، ٦٢٣٦ آية، ولا نقص ولا تكرار.');
  } 
+/* ===== إصلاح آمن: استعادة + ترميم حسب ترتيب الآيات ===== */
+function orderIssues(data){
+  let prev=0,n=0;
+  data.pages.forEach(pg=>(pg||[]).forEach(ln=>ln[1].forEach(w=>{
+    const k=w[1]*1000+w[2];
+    if(k<prev)n++;else prev=k;
+  })));
+  return n;
+}
+(function(){
+  const m=document.getElementById('menu');
+  if(!m)return;
+  const mkb=(t,f)=>{const b=document.createElement('button');b.textContent=t;b.style.cssText='display:block;margin:8px auto;font-size:13px';b.onclick=f;m.appendChild(b)};
+  mkb('↩ استعادة المصحف قبل الإصلاح',()=>restoreQuran());
+  mkb('♻ إعادة تحميل المصحف نظيفًا',()=>resetQuran());
+})();
+async function restoreQuran(){
+  const bak=await dbGet('all_bak');
+  if(!bak)return alert('لا توجد نسخة احتياطية. استخدم «إعادة تحميل المصحف نظيفًا».');
+  if(orderIssues(bak))return alert('النسخة الاحتياطية نفسها مختلة. استخدم «إعادة تحميل المصحف نظيفًا».');
+  if(!confirm('سأستعيد المصحف كما كان قبل الإصلاح. متابعة؟'))return;
+  await dbSet('all',bak);VIDX=null;await init();
+  alert('تمت الاستعادة. اضغط «فحص سلامة المصحف» للتأكد.');
+}
+async function resetQuran(){
+  if(!confirm('سأحذف نص المصحف المحفوظ لتحمّله من جديد (الصوت المحفوظ لا يُحذف). متابعة؟'))return;
+  await dbDel('all');await dbDel('all_bak');VIDX=null;D=null;await init();
+}
+
+const chunk=(a,n)=>{const r=[];for(let i=0;i<a.length;i+=n)r.push(a.slice(i,i+n));return r};
+function findEnd(c,v){
+  for(let pi=0;pi<D.pages.length;pi++){
+    const pg=D.pages[pi];if(!pg)continue;
+    for(let li=0;li<pg.length;li++){
+      const ws=pg[li][1];
+      for(let wi=0;wi<ws.length;wi++)if(ws[wi][4]&&ws[wi][1]===c&&ws[wi][2]===v)return [pi,li,wi];
+    }
+  }
+  return null;
+}
+function insertAfter(pi,li,wi,words){
+  const pg=D.pages[pi],ln=pg[li],L=ln[0];
+  const rest=ln[1].splice(wi+1);
+  const parts=chunk(words,7);
+  if(rest.length)parts.push(rest);
+  for(let k=li+1;k<pg.length;k++)pg[k][0]+=parts.length;
+  pg.splice(li+1,0,...parts.map((p,i)=>[L+1+i,p]));
+}
+async function repairQuran(){
+  const st=t=>{if(typeof rpStatus==='function')rpStatus(t)};
+  if(!D)return alert('حمّل المصحف أولًا');
+  if(!navigator.onLine)return alert('الإصلاح يحتاج إنترنت (مرة واحدة فقط).');
+  if(orderIssues(D))return alert('المصحف المحفوظ مختل الترتيب بسبب الإصلاح القديم. اضغط «استعادة المصحف قبل الإصلاح» أولًا.');
+  const have={};
+  D.pages.forEach(pg=>(pg||[]).forEach(ln=>ln[1].forEach(w=>{if(w[4])have[w[1]+':'+w[2]]=1})));
+  const miss=[];
+  SURAHS.forEach(s=>{for(let v=1;v<=s[2];v++)if(!have[s[0]+':'+v])miss.push([s[0],v])});
+  if(!miss.length)return alert('✓ لا توجد آيات ناقصة.');
+  if(!confirm('وجدتُ '+miss.length+' آية ناقصة. سأجلبها وأضعها بعد الآية التي قبلها مباشرة. متابعة؟'))return;
+  const got=[];let fail=0;
+  for(let i=0;i<miss.length;i++){
+    st('جلب الآيات: '+toAr(i+1)+' / '+toAr(miss.length));
+    try{
+      const [c,v]=miss[i];
+      const j=await jget(API+'verses/by_key/'+c+':'+v+'?words=true&word_fields=text_uthmani');
+      const ws=(j.verse.words||[]).slice().sort((a,b)=>a.position-b.position);
+      if(!ws.length)throw 0;
+      const w=ws.map(x=>[x.text_uthmani||'',c,v,x.position,x.char_type_name==='end'?1:0]);
+      if(!w[w.length-1][4])w.push(['',c,v,w.length+1,1]);
+      got.push({c:c,v:v,h:j.verse.hizb_number,j:j.verse.juz_number,w:w});
+    }catch(e){fail++}
+  }
+  if(!got.length){st();return alert('تعذّر جلب الآيات. تأكد من الإنترنت وجرّب لاحقًا.')}
+  st('جاري الترميم...');
+  await dbSet('all_bak',D);
+  let placed=0;
+  got.forEach(g=>{
+    const a=g.v>1?findEnd(g.c,g.v-1):null;
+    if(!a){fail++;return}
+    insertAfter(a[0],a[1],a[2],g.w);
+    D.vi.push([g.c,g.v,g.h,g.j,a[0]+1]);
+    placed++;
+  });
+  D.vi.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  await dbSet('all',D);VIDX=null;await init();st();
+  alert('أُضيفت '+toAr(placed)+' آية'+(fail?(' وتعذّر '+toAr(fail)+'. اضغط الإصلاح مرة أخرى.'):'')+'. سأعيد الفحص.');
+  verifyQuran();
+        }
